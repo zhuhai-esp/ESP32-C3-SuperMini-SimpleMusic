@@ -3,8 +3,15 @@
 #include <AudioGeneratorAAC.h>
 #include <AudioOutputI2S.h>
 #include <LittleFS.h>
+#include <OneButton.h>
 
 #define PIN_LED1 8
+#define PIN_BUTTON 9  // ESP32-C3 SuperMini 板载 BOOT 按键引脚，低电平有效
+
+// 板载 LED 为低电平点亮（GPIO8 写 LOW 亮、写 HIGH 灭）
+// 暂停/停止时 setLEDs(false) 写的是熄灭电平；若你的板子为高电平点亮，将下面两个值对调
+#define LED_ON LOW
+#define LED_OFF HIGH
 
 class MultiAudioPlayer {
 private:
@@ -17,6 +24,7 @@ private:
   int playlistSize = 0;             // 播放列表大小
   int currentTrackIndex = 0;        // 当前播放的曲目索引
   bool isPlaying = false;
+  bool paused = false;              // 暂停标志（冻结解码，保留进度）
 
 public:
   bool initialize() {
@@ -132,6 +140,7 @@ public:
     // 开始播放
     if (aac->begin(file, out)) {
       isPlaying = true;
+      paused = false;
       Serial.printf("开始播放: [%d/%d] %s\n", 
                     currentTrackIndex + 1, playlistSize, filename);
       return true;
@@ -145,6 +154,11 @@ public:
   bool update() {
     if (!isPlaying || !aac) {
       return false;
+    }
+
+    // 暂停中：不推进解码，冻结当前曲目进度（I2S 输出静音）
+    if (paused) {
+      return true;
     }
     
     if (aac->isRunning()) {
@@ -182,11 +196,27 @@ public:
     }
     cleanupAudio();
     isPlaying = false;
+    paused = false;
     Serial.println("音频播放已停止");
+  }
+
+  // 按键切换播放/暂停：未播放时启动播放列表，播放中时冻结/恢复解码
+  void togglePlayPause() {
+    if (!isPlaying) {
+      Serial.println("按键启动播放列表...");
+      startPlaylist();
+      return;
+    }
+    paused = !paused;
+    Serial.println(paused ? "已暂停" : "继续播放");
   }
 
   bool isAudioPlaying() {
     return isPlaying;
+  }
+
+  bool isPaused() {
+    return paused;
   }
 
   int getCurrentTrackIndex() {
@@ -255,7 +285,7 @@ public:
       // 交替闪烁
       led1State = !led1State;
       
-      digitalWrite(led1Pin, led1State ? HIGH : LOW);
+      digitalWrite(led1Pin, led1State ? LED_ON : LED_OFF);
       
       lastToggleTime = currentTime;
     }
@@ -263,7 +293,7 @@ public:
   
   void setLEDs(bool state1) {
     led1State = state1;
-    digitalWrite(led1Pin, led1State ? HIGH : LOW);
+    digitalWrite(led1Pin, state1 ? LED_ON : LED_OFF);
   }
   
   void setToggleInterval(unsigned long interval) {
@@ -273,12 +303,22 @@ public:
 
 LEDManager ledManager(PIN_LED1);
 
+// 按键管理：GPIO9 低电平有效（板载 BOOT 按键，外部上拉）
+OneButton button(PIN_BUTTON, true);
+
+void onButtonClick() {
+  audioPlayer.togglePlayPause();
+}
+
 void setup() {
   Serial.begin(115200);
   Serial.println("Hello ESP32C3!!");
   
   // 初始化LED管理器
   ledManager.begin();
+
+  // 初始化按键（单击切换播放/暂停）
+  button.attachClick(onButtonClick);
   
   // 初始化音频播放器
   if (audioPlayer.initialize()) {
@@ -300,25 +340,30 @@ void setup() {
 }
 
 void loop() {
+  // 按键扫描（需高频调用以可靠检测单击）
+  button.tick();
+
   // 更新音频播放状态
   audioPlayer.update();
-  
-  // 只有在播放音频时才闪烁LED
-  if (audioPlayer.isAudioPlaying()) {
+
+  // 播放中（未暂停）才闪烁LED
+  if (audioPlayer.isAudioPlaying() && !audioPlayer.isPaused()) {
     ledManager.update();
   } else {
-    // 如果没有播放音频，关闭LED
+    // 没有播放音频或已暂停时，关闭LED
     ledManager.setLEDs(false);
-    
-    // 如果播放停止，尝试重新开始播放列表
-    static unsigned long lastRetryTime = 0;
-    if (millis() - lastRetryTime > 5000) {  // 每5秒重试一次
-      Serial.println("尝试重新开始播放列表...");
-      audioPlayer.startPlaylist();
-      lastRetryTime = millis();
+
+    // 播放停止（非暂停）时，每5秒尝试重新开始播放列表
+    if (!audioPlayer.isPaused()) {
+      static unsigned long lastRetryTime = 0;
+      if (millis() - lastRetryTime > 5000) {
+        Serial.println("尝试重新开始播放列表...");
+        audioPlayer.startPlaylist();
+        lastRetryTime = millis();
+      }
     }
   }
-  
+
   // 短暂延迟以避免占用太多CPU时间
   delay(1);
 }
