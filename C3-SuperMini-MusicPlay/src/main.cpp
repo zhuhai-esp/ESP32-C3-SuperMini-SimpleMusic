@@ -1,369 +1,155 @@
 #include <Arduino.h>
-#include <AudioFileSourceLittleFS.h>
-#include <AudioGeneratorAAC.h>
-#include <AudioOutputI2S.h>
-#include <LittleFS.h>
-#include <OneButton.h>
 
-#define PIN_LED1 8
-#define PIN_BUTTON 9  // ESP32-C3 SuperMini 板载 BOOT 按键引脚，低电平有效
+#include "audio_player.h"
+#include "button_manager.h"
+#include "config.h"
+#include "led_manager.h"
+#include "log.h"
+#include "prompt_tone.h"
+#include "settings.h"
+#include "web_manager.h"
 
-// 板载 LED 为低电平点亮（GPIO8 写 LOW 亮、写 HIGH 灭）
-// 暂停/停止时 setLEDs(false) 写的是熄灭电平；若你的板子为高电平点亮，将下面两个值对调
-#define LED_ON LOW
-#define LED_OFF HIGH
-
-class MultiAudioPlayer {
-private:
-  AudioGeneratorAAC *aac = nullptr;
-  AudioFileSourceLittleFS *file = nullptr;
-  AudioOutputI2S *out = nullptr;
-  
-  // 多文件播放相关变量
-  const char **playlist = nullptr;  // 播放列表
-  int playlistSize = 0;             // 播放列表大小
-  int currentTrackIndex = 0;        // 当前播放的曲目索引
-  bool isPlaying = false;
-  bool paused = false;              // 暂停标志（冻结解码，保留进度）
-
-public:
-  bool initialize() {
-    Serial.begin(115200);
-    delay(1000);
-    if (!LittleFS.begin(true)) {
-      Serial.println("LittleFS挂载失败!");
-      return false;
-    }
-    Serial.printf("LittleFS总空间: %.2f KB\n", LittleFS.totalBytes() / 1024.0);
-    Serial.printf("LittleFS可用空间: %.2f KB\n",
-                  (LittleFS.totalBytes() - LittleFS.usedBytes()) / 1024.0);
-    Serial.println("LittleFS初始化成功!");
-    return true;
-  }
-
-  // 扫描指定扩展名的文件并创建播放列表
-  void createPlaylist(const char* extension = ".aac") {
-    Serial.println("\n=== 扫描音频文件 ===");
-    
-    // 第一次扫描：计算文件数量
-    int fileCount = 0;
-    File root = LittleFS.open("/");
-    File file = root.openNextFile();
-    while (file) {
-      String filename = file.name();
-      if (filename.endsWith(extension)) {
-        fileCount++;
-      }
-      file = root.openNextFile();
-    }
-    root.close();
-    
-    Serial.printf("找到 %d 个 %s 文件\n", fileCount, extension);
-    
-    if (fileCount == 0) {
-      Serial.println("未找到音频文件!");
-      return;
-    }
-    
-    // 分配内存给播放列表
-    if (playlist) {
-      delete[] playlist;
-    }
-    playlist = new const char*[fileCount];
-    playlistSize = fileCount;
-    
-    // 第二次扫描：填充播放列表
-    int index = 0;
-    root = LittleFS.open("/");
-    file = root.openNextFile();
-    while (file) {
-      String filename = file.name();
-      if (filename.endsWith(extension)) {
-        // 确保路径以/开头
-        if (!filename.startsWith("/")) {
-          filename = "/" + filename;
-        }
-        
-        // 复制文件名到播放列表
-        char* filepath = new char[filename.length() + 1];
-        strcpy(filepath, filename.c_str());
-        playlist[index++] = filepath;
-        Serial.printf("添加到播放列表: %s\n", filepath);
-      }
-      file = root.openNextFile();
-    }
-    root.close();
-  }
-
-  void listFiles() {
-    Serial.println("\n=== 文件列表 ===");
-    File root = LittleFS.open("/");
-    File file = root.openNextFile();
-    while (file) {
-      Serial.printf("文件: %s, 大小: %.2f KB\n", file.name(),
-                    file.size() / 1024.0);
-      file = root.openNextFile();
-    }
-    root.close();
-  }
-
-  bool startPlaylist() {
-    if (playlistSize == 0) {
-      Serial.println("播放列表为空!");
-      return false;
-    }
-    
-    currentTrackIndex = 0;
-    return playCurrentTrack();
-  }
-
-  bool playCurrentTrack() {
-    if (playlistSize == 0 || currentTrackIndex >= playlistSize) {
-      return false;
-    }
-    
-    if (isPlaying) {
-      stopAudio();
-    }
-    
-    const char* filename = playlist[currentTrackIndex];
-    
-    // 初始化音频输出
-    out = new AudioOutputI2S();
-    out->SetPinout(2, 1, 3);
-    out->SetGain(0.6);
-    
-    // 打开音频文件
-    file = new AudioFileSourceLittleFS(filename);
-    aac = new AudioGeneratorAAC();
-    
-    // 开始播放
-    if (aac->begin(file, out)) {
-      isPlaying = true;
-      paused = false;
-      Serial.printf("开始播放: [%d/%d] %s\n", 
-                    currentTrackIndex + 1, playlistSize, filename);
-      return true;
-    } else {
-      Serial.printf("音频播放器初始化失败: %s\n", filename);
-      cleanupAudio();
-      return false;
-    }
-  }
-
-  bool update() {
-    if (!isPlaying || !aac) {
-      return false;
-    }
-
-    // 暂停中：不推进解码，冻结当前曲目进度（I2S 输出静音）
-    if (paused) {
-      return true;
-    }
-    
-    if (aac->isRunning()) {
-      if (!aac->loop()) {
-        // 当前音频播放完成
-        aac->stop();
-        cleanupAudio();
-        isPlaying = false;
-        
-        // 播放下一首（顺序循环）
-        playNextTrack();
-        return true;
-      }
-      return true;  // 仍在播放中
-    }
-    return false;   // 播放已停止
-  }
-
-  bool playNextTrack() {
-    if (playlistSize == 0) return false;
-    
-    // 顺序循环播放
-    currentTrackIndex++;
-    if (currentTrackIndex >= playlistSize) {
-      currentTrackIndex = 0;  // 回到第一首，实现循环
-      Serial.println("=== 播放列表循环 ===");
-    }
-    
-    return playCurrentTrack();
-  }
-
-  void stopAudio() {
-    if (aac && aac->isRunning()) {
-      aac->stop();
-    }
-    cleanupAudio();
-    isPlaying = false;
-    paused = false;
-    Serial.println("音频播放已停止");
-  }
-
-  // 按键切换播放/暂停：未播放时启动播放列表，播放中时冻结/恢复解码
-  void togglePlayPause() {
-    if (!isPlaying) {
-      Serial.println("按键启动播放列表...");
-      startPlaylist();
-      return;
-    }
-    paused = !paused;
-    Serial.println(paused ? "已暂停" : "继续播放");
-  }
-
-  bool isAudioPlaying() {
-    return isPlaying;
-  }
-
-  bool isPaused() {
-    return paused;
-  }
-
-  int getCurrentTrackIndex() {
-    return currentTrackIndex;
-  }
-
-  int getPlaylistSize() {
-    return playlistSize;
-  }
-
-  const char* getCurrentTrackName() {
-    if (playlistSize > 0 && currentTrackIndex < playlistSize) {
-      return playlist[currentTrackIndex];
-    }
-    return nullptr;
-  }
-
-  ~MultiAudioPlayer() {
-    // 清理播放列表内存
-    if (playlist) {
-      for (int i = 0; i < playlistSize; i++) {
-        delete[] playlist[i];
-      }
-      delete[] playlist;
-    }
-  }
-
-private:
-  void cleanupAudio() {
-    if (aac) {
-      delete aac;
-      aac = nullptr;
-    }
-    if (file) {
-      delete file;
-      file = nullptr;
-    }
-    if (out) {
-      delete out;
-      out = nullptr;
-    }
-  }
-};
-
+// ========== 全局对象 ==========
+// 各功能模块的实现见对应源文件，本文件只负责装配与调度
 MultiAudioPlayer audioPlayer;
+LEDManager ledManager(PIN_LED);
+ButtonManager buttonManager(PIN_BUTTON, /*activeLow=*/true);
+Settings settings;
+WebManager webManager(&audioPlayer, &settings);
 
-// LED状态管理
-class LEDManager {
-private:
-  uint8_t led1Pin;
-  bool led1State = false;
-  unsigned long lastToggleTime = 0;
-  unsigned long toggleInterval = 200;  // 闪烁间隔(ms)
+// 开机自动播放开关当前值（Web 修改后下次开机生效）
+bool gAutoPlay = true;
 
-public:
-  LEDManager(uint8_t pin1) : led1Pin(pin1) {}
-  
-  void begin() {
-    pinMode(led1Pin, OUTPUT);
-    setLEDs(false);  // 初始状态都关闭
+// 是否因客户端接入热点而被自动暂停（断开后据此恢复，用户手动操作会清除）
+bool gPausedForClient = false;
+
+// 客户端接入/断开时的播放策略：ESP32-C3 单核难以同时兼顾播放与 Web 服务，
+// 有客户端接入时自动暂停，全部断开后恢复。
+void handleClientPresence() {
+  if (webManager.takeStationConnected()) {
+    if (audioPlayer.isAudioPlaying() && !audioPlayer.isPaused()) {
+      audioPlayer.togglePlayPause();
+      gPausedForClient = true;
+    }
+    LOG_I("客户端接入热点，播放已暂停");
   }
-  
-  void update() {
-    unsigned long currentTime = millis();
-    if (currentTime - lastToggleTime >= toggleInterval) {
-      // 交替闪烁
-      led1State = !led1State;
-      
-      digitalWrite(led1Pin, led1State ? LED_ON : LED_OFF);
-      
-      lastToggleTime = currentTime;
+  if (webManager.takeStationDisconnected()) {
+    if (gPausedForClient) {
+      audioPlayer.togglePlayPause();  // 恢复播放
+      gPausedForClient = false;
+      LOG_I("客户端已断开，恢复播放");
     }
   }
-  
-  void setLEDs(bool state1) {
-    led1State = state1;
-    digitalWrite(led1Pin, state1 ? LED_ON : LED_OFF);
+}
+
+// LED 指示 + 播放异常时的自动重试
+void updateLedState() {
+  // 无音频文件：快闪（等待通过 Web 上传文件）
+  if (audioPlayer.getPlaylistSize() == 0) {
+    ledManager.setMode(LedMode::FAST_BLINK);
+    return;
   }
-  
-  void setToggleInterval(unsigned long interval) {
-    toggleInterval = interval;
+
+  if (audioPlayer.isAudioPlaying()) {
+    // 暂停熄灭，正常播放慢闪
+    ledManager.setMode(audioPlayer.isPaused() ? LedMode::OFF : LedMode::SLOW_BLINK);
+    return;
   }
-};
 
-LEDManager ledManager(PIN_LED1);
-
-// 按键管理：GPIO9 低电平有效（板载 BOOT 按键，外部上拉）
-OneButton button(PIN_BUTTON, true);
-
-void onButtonClick() {
-  audioPlayer.togglePlayPause();
+  if (gAutoPlay) {
+    // 有文件但未在播放（异常停止）：快闪并定期重试
+    ledManager.setMode(LedMode::FAST_BLINK);
+    static unsigned long lastRetryTime = 0;
+    if (millis() - lastRetryTime > PLAYLIST_RETRY_INTERVAL) {
+      LOG_I("尝试重新开始播放列表...");
+      audioPlayer.startPlaylist();
+      lastRetryTime = millis();
+    }
+  } else {
+    // 自动播放关闭：待机
+    ledManager.setMode(LedMode::OFF);
+  }
 }
 
 void setup() {
-  Serial.begin(115200);
-  Serial.println("Hello ESP32C3!!");
-  
-  // 初始化LED管理器
-  ledManager.begin();
+  Serial.begin(SERIAL_BAUD);
+  LOG_I("Hello ESP32C3!!");
 
-  // 初始化按键（单击切换播放/暂停）
-  button.attachClick(onButtonClick);
-  
-  // 初始化音频播放器
-  if (audioPlayer.initialize()) {
-    audioPlayer.listFiles();
-    
-    // 自动扫描所有AAC文件创建播放列表
-    audioPlayer.createPlaylist(".aac");
-    
-    // 开始顺序循环播放
-    if (!audioPlayer.startPlaylist()) {
-      Serial.println("无法开始播放音频!");
+  ledManager.begin();
+  buttonManager.attachClick([] {
+    audioPlayer.togglePlayPause();
+    gPausedForClient = false;  // 用户手动操作，接管播放状态
+  });
+  buttonManager.attachLongPressStop([] {
+    // 长按（约1秒）：暂停播放 → 播放重置提示音 → 恢复默认设置（不动 SPIFFS 文件）
+    if (audioPlayer.isAudioPlaying() && !audioPlayer.isPaused()) {
+      audioPlayer.togglePlayPause();
     }
-  } else {
-    Serial.println("音频播放器初始化失败，系统无法启动");
+    playResetTone(settings.loadVolume());
+    settings.resetAll();
+    audioPlayer.setVolume(DEFAULT_VOLUME);  // 立即应用默认音量（并落库，与 resetAll 一致）
+    gPausedForClient = false;               // 已手动暂停，清除自动暂停标志
+    webManager.reapplyAp();                 // AP 密码恢复默认，热点重启
+    LOG_I("长按重置完成，设置已恢复默认（音频文件保留）");
+  });
+
+  // 事件回调：掉电记忆 + 错误日志（上层不轮询内部状态）
+  audioPlayer.setOnTrackChanged([](int index, const String& name) {
+    settings.saveTrackIndex(index);
+    LOG_I("记录播放位置: [%d] %s", index, name.c_str());
+  });
+  audioPlayer.setOnVolumeChanged([](float volume) {
+    settings.saveVolume(volume);
+  });
+  audioPlayer.setOnError([](const String& message) {
+    LOG_E("%s", message.c_str());
+  });
+
+  // 恢复掉电前的设置
+  settings.begin();
+  gAutoPlay = settings.loadAutoPlay();
+  float savedVolume = settings.loadVolume();
+  audioPlayer.setVolume(savedVolume);
+  LOG_I("恢复设置: 音量=%.2f, 自动播放=%s", savedVolume, gAutoPlay ? "开" : "关");
+
+  if (!audioPlayer.initialize()) {
+    LOG_E("音频播放器初始化失败，系统无法启动");
+    ledManager.setMode(LedMode::FAST_BLINK);
     while (1) {
       delay(1000);
     }
   }
+
+  // 开机提示音（阻塞约 0.3 秒）
+  playStartupTone(savedVolume);
+
+  // 启动 Web 管理（AP 模式，无需配网）
+  webManager.begin();
+
+  // 扫描音频文件
+  audioPlayer.listFiles();
+  int fileCount = audioPlayer.createPlaylist();
+
+  if (fileCount == 0) {
+    LOG_E("未找到音频文件，请连接热点 %s 后访问网页上传", webManager.getApSsid().c_str());
+    ledManager.setMode(LedMode::FAST_BLINK);
+  } else if (gAutoPlay) {
+    // 掉电记忆：从上次播放位置继续
+    int savedIndex = settings.loadTrackIndex();
+    LOG_I("自动播放开启，从索引 %d 开始", savedIndex);
+    audioPlayer.startPlaylist(savedIndex);
+  } else {
+    LOG_I("自动播放已关闭，待机中（按键可启动播放）");
+    ledManager.setMode(LedMode::OFF);
+  }
 }
 
 void loop() {
-  // 按键扫描（需高频调用以可靠检测单击）
-  button.tick();
-
-  // 更新音频播放状态
-  audioPlayer.update();
-
-  // 播放中（未暂停）才闪烁LED
-  if (audioPlayer.isAudioPlaying() && !audioPlayer.isPaused()) {
-    ledManager.update();
-  } else {
-    // 没有播放音频或已暂停时，关闭LED
-    ledManager.setLEDs(false);
-
-    // 播放停止（非暂停）时，每5秒尝试重新开始播放列表
-    if (!audioPlayer.isPaused()) {
-      static unsigned long lastRetryTime = 0;
-      if (millis() - lastRetryTime > 5000) {
-        Serial.println("尝试重新开始播放列表...");
-        audioPlayer.startPlaylist();
-        lastRetryTime = millis();
-      }
-    }
-  }
-
-  // 短暂延迟以避免占用太多CPU时间
+  buttonManager.tick();      // 按键扫描（高频调用保证单击检测可靠）
+  webManager.handleClient(); // Web 管理（分块处理，不阻塞音频）
+  handleClientPresence();    // 客户端接入暂停/断开恢复
+  audioPlayer.update();      // 音频解码驱动
+  updateLedState();          // LED 模式切换（播放/无文件/暂停）
+  ledManager.update();       // LED 闪烁驱动（快/慢闪的翻转靠它）
   delay(1);
 }

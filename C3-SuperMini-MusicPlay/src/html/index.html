@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>C3 音乐播放器</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;background:#0f1419;color:#e6e1cf;padding:16px;max-width:640px;margin:0 auto}
+h1{font-size:20px;margin-bottom:4px}
+.sub{color:#8a9199;font-size:12px;margin-bottom:16px}
+.card{background:#1a2027;border:1px solid #2a323c;border-radius:12px;padding:16px;margin-bottom:14px}
+.card h2{font-size:15px;margin-bottom:12px;color:#9ecbff}
+.row{display:flex;justify-content:space-between;align-items:center;padding:6px 0;font-size:14px}
+.row .k{color:#8a9199}
+.row .v{color:#e6e1cf;font-weight:500;text-align:right;word-break:break-all}
+.chip{display:inline-block;padding:2px 10px;border-radius:99px;font-size:12px}
+.chip.play{background:#123f2a;color:#4ade80}
+.chip.pause{background:#3d3512;color:#fbbf24}
+.chip.stop{background:#3d1f1f;color:#f87171}
+button{background:#2563eb;color:#fff;border:none;border-radius:8px;padding:8px 16px;font-size:14px;cursor:pointer}
+button:hover{background:#1d4ed8}
+button.danger{background:#dc2626}
+button.danger:hover{background:#b91c1c}
+button:disabled{background:#2a323c;color:#6b7280;cursor:not-allowed}
+input[type=file]{font-size:13px;color:#8a9199;width:100%;margin-bottom:8px}
+input[type=text],input[type=password]{background:#0f1419;border:1px solid #2a323c;border-radius:8px;color:#e6e1cf;padding:8px 10px;font-size:14px;width:100%}
+progress{width:100%;height:8px;margin-top:10px}
+.bar{height:10px;background:#0f1419;border:1px solid #2a323c;border-radius:99px;overflow:hidden;margin-top:8px}
+.bar>div{height:100%;background:linear-gradient(90deg,#2563eb,#60a5fa);border-radius:99px;transition:width .3s}
+table{width:100%;border-collapse:collapse;font-size:13px}
+td,th{padding:8px 6px;text-align:left;border-bottom:1px solid #2a323c}
+th{color:#8a9199;font-weight:500}
+input[type=range]{width:100%;accent-color:#2563eb}
+.switch{position:relative;width:46px;height:24px;display:inline-block}
+.switch input{opacity:0;width:0;height:0}
+.slider{position:absolute;inset:0;background:#2a323c;border-radius:24px;transition:.2s;cursor:pointer}
+.slider:before{content:"";position:absolute;width:18px;height:18px;left:3px;top:3px;background:#fff;border-radius:50%;transition:.2s}
+input:checked+.slider{background:#2563eb}
+input:checked+.slider:before{transform:translateX(22px)}
+.flex{display:flex;gap:8px;align-items:center}
+.hint{font-size:12px;color:#8a9199;margin-top:8px;line-height:1.6}
+#msg{font-size:12px;color:#8a9199;margin-top:8px;min-height:16px}
+</style>
+</head>
+<body>
+<h1>C3 音乐播放器</h1>
+<div class="sub" id="netinfo">正在连接...</div>
+
+<div class="card">
+  <h2>播放状态</h2>
+  <div class="row"><span class="k">状态</span><span class="v" id="state">--</span></div>
+  <div class="row"><span class="k">当前曲目</span><span class="v" id="track">--</span></div>
+  <div class="row"><span class="k">播放进度</span><span class="v" id="idx">--</span></div>
+</div>
+
+<div class="card">
+  <h2>存储分区（SPIFFS）</h2>
+  <div class="row"><span class="k">已用 / 总计</span><span class="v" id="space">--</span></div>
+  <div class="bar"><div id="spacebar" style="width:0%"></div></div>
+  <div class="flex" style="margin-top:12px">
+    <button class="danger" onclick="formatFs()">格式化分区</button>
+    <span class="hint" style="margin:0">将停止播放并清空所有音频文件</span>
+  </div>
+</div>
+
+<div class="card">
+  <h2>文件管理（仅 .aac）</h2>
+  <div class="hint" style="color:#fbbf24;margin-bottom:10px;line-height:1.7">
+    注意：请使用系统浏览器（Safari / Chrome）打开本页上传文件。若当前页面是连接 WiFi 时自动弹出的认证页，请在浏览器地址栏手动输入 <b>http://192.168.4.1</b> 打开本页——认证页通常无法选择文件。
+  </div>
+  <input type="file" id="file" accept=".aac">
+  <div class="flex">
+    <button onclick="upload()">上传</button>
+    <button class="danger" onclick="refreshFiles()">刷新列表</button>
+  </div>
+  <progress id="pg" value="0" max="100"></progress>
+  <div id="msg"></div>
+  <table><thead><tr><th>文件名</th><th>大小</th><th style="text-align:right">操作</th></tr></thead>
+  <tbody id="files"></tbody></table>
+</div>
+
+<div class="card">
+  <h2>音量</h2>
+  <div class="row"><span class="k">当前</span><span class="v" id="volval">--</span></div>
+  <input type="range" id="vol" min="0" max="100" value="60" oninput="onVolInput()">
+  <div class="flex" style="margin-top:10px">
+    <button id="volsave" onclick="setVolume()">保存音量</button>
+    <span class="hint" id="volhint" style="margin:0">调节后需点击「保存音量」</span>
+  </div>
+</div>
+
+<div class="card">
+  <h2>热点设置</h2>
+  <div class="row"><span class="k">热点名称（SSID）</span><span class="v" id="apssid">--</span></div>
+  <div class="row"><span class="k">管理地址</span><span class="v" id="apip">--</span></div>
+  <div class="row" style="align-items:flex-start;padding-top:10px">
+    <span class="k" style="padding-top:8px">连接密码</span>
+    <span class="v" style="width:55%"><input type="text" id="appwd" maxlength="63" placeholder="8-63 位"></span>
+  </div>
+  <div class="flex" style="margin-top:10px">
+    <button onclick="setApPwd()">修改密码</button>
+    <span class="hint" style="margin:0">修改后热点重启，需重新连接</span>
+  </div>
+</div>
+
+<div class="card">
+  <h2>开机自动播放</h2>
+  <div class="row"><span class="k">下次开机生效</span>
+    <label class="switch"><input type="checkbox" id="ap" onchange="onAutoPlayInput()"><span class="slider"></span></label>
+  </div>
+  <div class="flex" style="margin-top:10px">
+    <button id="apsave" onclick="setAutoPlay()">保存</button>
+    <span class="hint" id="aphint" style="margin:0">切换后需点击「保存」，下次开机生效</span>
+  </div>
+</div>
+
+<div class="card">
+  <h2>系统</h2>
+  <div class="row"><span class="k">重启设备</span>
+    <button class="danger" style="padding:6px 14px;font-size:13px" onclick="reboot()">重启</button>
+  </div>
+  <div class="hint">有客户端接入热点时播放会自动暂停，全部断开后自动恢复（单核性能限制）。</div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+let fileList = [];
+let volDirty = false;   // 音量有未保存的修改
+let apDirty = false;    // 自动播放开关有未保存的修改
+function esc(s){ const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+async function jget(u){ return (await (await fetch(u)).json()); }
+
+async function refresh(){
+  try {
+    const s = await jget('/api/status');
+    const label = {playing:'播放中', paused:'已暂停', stopped:'已停止'}[s.state] || s.state;
+    $('state').innerHTML = '<span class="chip ' + s.state + '">' + label + '</span>';
+    $('track').textContent = s.track || '--';
+    $('idx').textContent = (s.total > 0) ? ((s.index + 1) + ' / ' + s.total) : '--';
+    const pct = s.totalKB > 0 ? Math.round(s.usedKB / s.totalKB * 100) : 0;
+    $('space').textContent = s.usedKB + ' KB / ' + s.totalKB + ' KB（' + pct + '%）';
+    $('spacebar').style.width = pct + '%';
+    if (!volDirty) {
+      $('vol').value = Math.round(s.volume * 100);
+      $('volval').textContent = Math.round(s.volume * 100) + '%';
+    }
+    if (!apDirty) $('ap').checked = !!s.autoPlay;
+    $('netinfo').textContent = 'AP: ' + s.apSSID + ' · ' + s.apIP + ' · 已连接设备 ' + s.clients;
+  } catch (e) { $('netinfo').textContent = '连接失败，请确认已加入热点'; }
+}
+async function refreshAp(){
+  try {
+    const a = await jget('/api/apinfo');
+    $('apssid').textContent = a.ssid;
+    $('apip').textContent = 'http://' + a.ip;
+    if (document.activeElement !== $('appwd')) $('appwd').value = a.password;
+  } catch (e) {}
+}
+async function refreshFiles(){
+  try {
+    const d = await jget('/api/files');
+    fileList = d.files;
+    let h = '';
+    fileList.forEach((f, i) => {
+      h += '<tr><td>' + esc(f.name) + '</td><td>' + f.sizeKB + ' KB</td>' +
+           '<td style="text-align:right"><button class="danger" style="padding:4px 10px;font-size:12px" onclick="del(' + i + ')">删除</button></td></tr>';
+    });
+    $('files').innerHTML = h || '<tr><td colspan="3" style="color:#8a9199">暂无文件</td></tr>';
+  } catch (e) {}
+}
+function onVolInput(){
+  volDirty = true;
+  $('volval').textContent = $('vol').value + '%';
+  $('volhint').textContent = '有未保存的修改';
+}
+async function setVolume(){
+  if (!volDirty) { $('volhint').textContent = '音量未修改'; return; }
+  await fetch('/api/volume', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'},
+    body:'volume=' + ($('vol').value / 100)});
+  volDirty = false;
+  $('volhint').textContent = '已保存';
+  refresh();
+}
+function onAutoPlayInput(){
+  apDirty = true;
+  $('aphint').textContent = '有未保存的修改';
+}
+async function setAutoPlay(){
+  if (!apDirty) { $('aphint').textContent = '设置未修改'; return; }
+  await fetch('/api/autoplay', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'},
+    body:'enabled=' + ($('ap').checked ? 1 : 0)});
+  apDirty = false;
+  $('aphint').textContent = '已保存，下次开机生效';
+  refresh();
+}
+async function setApPwd(){
+  const pwd = $('appwd').value.trim();
+  if (pwd.length < 8 || pwd.length > 63) { $('msg').textContent = '密码长度需为 8-63 位'; return; }
+  $('msg').textContent = '正在修改...';
+  const r = await (await fetch('/api/appwd', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'},
+    body:'pwd=' + encodeURIComponent(pwd)})).json();
+  $('msg').textContent = r.msg || '';
+  if (r.ok) { setTimeout(() => { $('msg').textContent = '热点已重启，请重新连接 ' + $('apssid').textContent; }, 1500); }
+}
+function upload(){
+  const f = $('file').files[0];
+  if (!f) { $('msg').textContent = '请先选择 .aac 文件'; return; }
+  if (!f.name.toLowerCase().endsWith('.aac')) { $('msg').textContent = '仅支持 .aac 文件'; return; }
+  const fd = new FormData();
+  fd.append('file', f, f.name);
+  const xhr = new XMLHttpRequest();
+  xhr.upload.onprogress = e => { if (e.lengthComputable) $('pg').value = e.loaded / e.total * 100; };
+  xhr.onload = () => { $('msg').textContent = xhr.responseText; $('pg').value = 0; refresh(); refreshFiles(); };
+  xhr.onerror = () => { $('msg').textContent = '上传失败'; };
+  xhr.open('POST', '/api/upload');
+  xhr.send(fd);
+}
+async function del(i){
+  const name = fileList[i].name;
+  if (!confirm('确定删除 ' + name + ' ?')) return;
+  const r = await (await fetch('/api/delete?name=' + encodeURIComponent(name))).json();
+  $('msg').textContent = r.msg || '';
+  refresh();
+  refreshFiles();
+}
+async function formatFs(){
+  if (!confirm('确定格式化 SPIFFS 分区？\n将停止播放并清空所有音频文件！')) return;
+  $('msg').textContent = '正在格式化...';
+  const r = await (await fetch('/api/format', {method:'POST'})).json();
+  $('msg').textContent = r.msg || '';
+  refresh();
+  refreshFiles();
+}
+async function reboot(){
+  if (!confirm('确定重启设备？')) return;
+  $('msg').textContent = '正在重启...';
+  try { await (await fetch('/api/reboot', {method:'POST'})).json(); } catch (e) {}
+  $('msg').textContent = '重启命令已发送，设备就绪后请刷新页面';
+}
+refresh();
+refreshAp();
+refreshFiles();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>
